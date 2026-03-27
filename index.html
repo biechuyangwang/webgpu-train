@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js WebGPU Train</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; }
+        #info {
+            position: fixed; top: 16px; left: 16px;
+            color: #e8e8e8; background: rgba(0,0,0,0.55);
+            padding: 12px 20px; border-radius: 10px;
+            font-size: 13px; line-height: 1.7;
+            pointer-events: none; backdrop-filter: blur(6px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        #info h2 { font-size: 15px; margin-bottom: 2px; color: #64ffda; letter-spacing: 0.5px; }
+        #info .sub { color: #aaa; font-size: 12px; }
+        #gpu-badge {
+            position: fixed; top: 16px; right: 16px;
+            padding: 6px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
+            pointer-events: none; backdrop-filter: blur(6px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .gpu-webgpu { background: rgba(0,200,120,0.3); color: #64ffda; }
+        .gpu-webgl  { background: rgba(200,150,0,0.3); color: #ffc107; }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.170.0/build/three.webgpu.js",
+            "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="info">
+        <h2>WebGPU Train</h2>
+        <div class="sub">Drag to orbit &bull; Scroll to zoom</div>
+        <div id="fps" class="sub">FPS: --</div>
+    </div>
+    <div id="gpu-badge" class="gpu-webgpu">WebGPU</div>
+
+    <script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ============================================================
+// Renderer
+// ============================================================
+let renderer, isWebGPU = false;
+const badge = document.getElementById('gpu-badge');
+
+async function createRenderer() {
+    // Try WebGPU first
+    if (navigator.gpu) {
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (adapter) {
+                const info = await adapter.requestAdapterInfo?.() || {};
+                console.log('GPU Adapter:', JSON.stringify(info));
+            }
+        } catch (e) {
+            console.warn('Failed to query GPU adapter:', e);
+        }
+        try {
+            const r = new THREE.WebGPURenderer({ antialias: true });
+            r.setSize(window.innerWidth, window.innerHeight);
+            r.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            await r.init();
+            isWebGPU = true;
+            return r;
+        } catch (e) {
+            console.warn('WebGPU init failed:', e.message);
+        }
+    }
+    // Fallback to WebGL
+    const r = new THREE.WebGLRenderer({ antialias: true });
+    r.setSize(window.innerWidth, window.innerHeight);
+    r.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    return r;
+}
+
+// ============================================================
+// Scene, Camera, Controls
+// ============================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.FogExp2(0xc8dce8, 0.012);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(22, 14, 22);
+
+let controls; // will be created in init() after renderer is ready
+
+window.addEventListener('resize', () => {
+    if (!renderer) return;
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============================================================
+// Lighting
+// ============================================================
+// HemisphereLight is not supported in WebGPU node-based lighting
+// Use directional + ambient instead
+const sunLight = new THREE.DirectionalLight(0xfff4e0, 1.6);
+sunLight.position.set(25, 35, 15);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(2048, 2048);
+sunLight.shadow.camera.left = -30;
+sunLight.shadow.camera.right = 30;
+sunLight.shadow.camera.top = 30;
+sunLight.shadow.camera.bottom = -30;
+sunLight.shadow.camera.near = 1;
+sunLight.shadow.camera.far = 80;
+sunLight.shadow.bias = -0.001;
+scene.add(sunLight);
+
+// Fill light from opposite side (simulates sky bounce)
+const fillLight = new THREE.DirectionalLight(0x88aacc, 0.4);
+fillLight.position.set(-15, 10, -10);
+scene.add(fillLight);
+
+const ambientLight = new THREE.AmbientLight(0x606080, 0.5);
+scene.add(ambientLight);
+
+// ============================================================
+// Track Curve
+// ============================================================
+const trackPoints = [
+    new THREE.Vector3(-12, 0, -7),
+    new THREE.Vector3(-10, 0, 8),
+    new THREE.Vector3(-3, 0, 11),
+    new THREE.Vector3(5, 0, 10),
+    new THREE.Vector3(11, 0, 5),
+    new THREE.Vector3(13, 0, -3),
+    new THREE.Vector3(9, 0, -10),
+    new THREE.Vector3(2, 0, -12),
+    new THREE.Vector3(-5, 0, -11),
+];
+const trackCurve = new THREE.CatmullRomCurve3(trackPoints, true, 'catmullrom', 0.5);
+const TRACK_SAMPLES = 300;
+
+// ============================================================
+// Materials
+// ============================================================
+const matSteel = new THREE.MeshStandardMaterial({ color: 0x666680, roughness: 0.3, metalness: 0.8 });
+const matWood  = new THREE.MeshStandardMaterial({ color: 0x5c3a1e, roughness: 0.85 });
+const matGround = new THREE.MeshStandardMaterial({ color: 0x4a7c3f, roughness: 0.95 });
+const matGravel = new THREE.MeshStandardMaterial({ color: 0x8a8a7a, roughness: 0.9 });
+const matTreeTrunk = new THREE.MeshStandardMaterial({ color: 0x5c3d1e, roughness: 0.9 });
+const matTreeLeaf = new THREE.MeshStandardMaterial({ color: 0x2d7a2d, roughness: 0.8 });
+const matMountain = new THREE.MeshStandardMaterial({ color: 0x6b7b6b, roughness: 0.95 });
+const matSnow = new THREE.MeshStandardMaterial({ color: 0xeef4f8, roughness: 0.7 });
+
+const CAR_COLORS = [0xcc2222, 0x2255bb, 0xddaa00, 0x228844];
+const carMats = CAR_COLORS.map(c => new THREE.MeshStandardMaterial({ color: c, roughness: 0.35, metalness: 0.15 }));
+
+const matLocoBody = new THREE.MeshStandardMaterial({ color: 0x1a1a2e, roughness: 0.3, metalness: 0.4 });
+const matLocoCabin = new THREE.MeshStandardMaterial({ color: 0x8b0000, roughness: 0.4, metalness: 0.2 });
+const matLocoChimney = new THREE.MeshStandardMaterial({ color: 0x333340, roughness: 0.35, metalness: 0.6 });
+const matWheel = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.5, metalness: 0.7 });
+
+// ============================================================
+// Ground
+// ============================================================
+const groundGeo = new THREE.CircleGeometry(60, 64);
+groundGeo.rotateX(-Math.PI / 2);
+const ground = new THREE.Mesh(groundGeo, matGround);
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ============================================================
+// Rails
+// ============================================================
+const GAUGE = 0.35;
+const railRadius = 0.035;
+
+function createRail(offset) {
+    // Build offset curve: shift each point perpendicular to tangent
+    const pts = [];
+    for (let i = 0; i <= TRACK_SAMPLES; i++) {
+        const t = i / TRACK_SAMPLES;
+        const p = trackCurve.getPointAt(t);
+        const tang = trackCurve.getTangentAt(t);
+        // perpendicular in XZ plane
+        const nx = -tang.z, nz = tang.x;
+        const len = Math.sqrt(nx * nx + nz * nz) || 1;
+        pts.push(new THREE.Vector3(p.x + nx / len * offset, p.y, p.z + nz / len * offset));
+    }
+    const railCurve = new THREE.CatmullRomCurve3(pts, true);
+    const geo = new THREE.TubeGeometry(railCurve, TRACK_SAMPLES, railRadius, 6, true);
+    const mesh = new THREE.Mesh(geo, matSteel);
+    mesh.castShadow = true;
+    return mesh;
+}
+scene.add(createRail(GAUGE));
+scene.add(createRail(-GAUGE));
+
+// ============================================================
+// Sleepers
+// ============================================================
+const SLEEPER_COUNT = 160;
+const sleeperGeo = new THREE.BoxGeometry(0.9, 0.05, 0.15);
+const sleeperMesh = new THREE.InstancedMesh(sleeperGeo, matWood, SLEEPER_COUNT);
+sleeperMesh.receiveShadow = true;
+sleeperMesh.castShadow = true;
+
+const dummy = new THREE.Object3D();
+for (let i = 0; i < SLEEPER_COUNT; i++) {
+    const t = i / SLEEPER_COUNT;
+    const p = trackCurve.getPointAt(t);
+    const tang = trackCurve.getTangentAt(t);
+    const angle = Math.atan2(tang.x, tang.z);
+    dummy.position.set(p.x, 0.02, p.z);
+    dummy.rotation.set(0, angle, 0);
+    dummy.updateMatrix();
+    sleeperMesh.setMatrixAt(i, dummy.matrix);
+}
+scene.add(sleeperMesh);
+
+// ============================================================
+// Trees
+// ============================================================
+function createTree(x, z, scale = 1) {
+    const group = new THREE.Group();
+    const trunkH = 1.2 * scale;
+    const trunkR = 0.12 * scale;
+    const trunk = new THREE.Mesh(
+        new THREE.CylinderGeometry(trunkR * 0.7, trunkR, trunkH, 6),
+        matTreeTrunk
+    );
+    trunk.position.y = trunkH / 2;
+    trunk.castShadow = true;
+    group.add(trunk);
+
+    const leafR = 0.7 * scale;
+    const leafH = 1.8 * scale;
+    const leaves = new THREE.Mesh(
+        new THREE.ConeGeometry(leafR, leafH, 7),
+        matTreeLeaf
+    );
+    leaves.position.y = trunkH + leafH * 0.4;
+    leaves.castShadow = true;
+    group.add(leaves);
+
+    // Second layer
+    const leaves2 = new THREE.Mesh(
+        new THREE.ConeGeometry(leafR * 0.7, leafH * 0.7, 7),
+        matTreeLeaf
+    );
+    leaves2.position.y = trunkH + leafH * 0.95;
+    leaves2.castShadow = true;
+    group.add(leaves2);
+
+    group.position.set(x, 0, z);
+    return group;
+}
+
+// Place trees avoiding the track center
+function isNearTrack(x, z, dist = 2.5) {
+    for (let t = 0; t < 1; t += 0.02) {
+        const p = trackCurve.getPointAt(t);
+        if ((p.x - x) ** 2 + (p.z - z) ** 2 < dist * dist) return true;
+    }
+    return false;
+}
+
+const treeSeeds = [
+    [-18, -5], [-16, 8], [-8, 16], [2, 17], [10, 14], [17, 8],
+    [19, -4], [16, -14], [8, -17], [-2, -18], [-10, -16], [-20, 0],
+    [-22, 12], [14, 18], [22, 10], [22, -12], [14, -20], [-14, -20],
+    [-22, -10], [0, -22], [-5, 22], [20, 2], [-20, 5], [7, -22],
+    [-15, 18], [18, 18], [-22, -15], [25, 0], [-25, 5], [0, 25],
+];
+treeSeeds.forEach(([x, z]) => {
+    if (!isNearTrack(x, z, 3)) {
+        const s = 0.7 + Math.random() * 0.8;
+        scene.add(createTree(x, z, s));
+    }
+});
+
+// ============================================================
+// Mountains
+// ============================================================
+function createMountain(x, z, radius, height) {
+    const geo = new THREE.ConeGeometry(radius, height, 8);
+    const mesh = new THREE.Mesh(geo, matMountain);
+    mesh.position.set(x, height / 2, z);
+    mesh.castShadow = true;
+    scene.add(mesh);
+
+    // Snow cap
+    if (height > 12) {
+        const snowGeo = new THREE.ConeGeometry(radius * 0.35, height * 0.25, 8);
+        const snowMesh = new THREE.Mesh(snowGeo, matSnow);
+        snowMesh.position.set(x, height * 0.88, z);
+        scene.add(snowMesh);
+    }
+}
+
+createMountain(-30, -25, 12, 18);
+createMountain(30, -30, 10, 14);
+createMountain(-35, 20, 14, 22);
+createMountain(35, 25, 11, 16);
+createMountain(0, -35, 9, 12);
+
+// ============================================================
+// Train Builder
+// ============================================================
+function buildLocomotive() {
+    const group = new THREE.Group();
+
+    // Boiler (horizontal cylinder)
+    const boiler = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.28, 0.28, 1.4, 12),
+        matLocoBody
+    );
+    boiler.rotation.z = Math.PI / 2;
+    boiler.position.set(0.2, 0.38, 0);
+    boiler.castShadow = true;
+    group.add(boiler);
+
+    // Boiler front cap
+    const cap = new THREE.Mesh(
+        new THREE.SphereGeometry(0.28, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2),
+        matLocoBody
+    );
+    cap.rotation.z = -Math.PI / 2;
+    cap.position.set(0.9, 0.38, 0);
+    group.add(cap);
+
+    // Cabin
+    const cabin = new THREE.Mesh(
+        new THREE.BoxGeometry(0.7, 0.55, 0.7),
+        matLocoCabin
+    );
+    cabin.position.set(-0.55, 0.48, 0);
+    cabin.castShadow = true;
+    group.add(cabin);
+
+    // Cabin roof
+    const roof = new THREE.Mesh(
+        new THREE.BoxGeometry(0.8, 0.06, 0.8),
+        matLocoBody
+    );
+    roof.position.set(-0.55, 0.78, 0);
+    roof.castShadow = true;
+    group.add(roof);
+
+    // Chimney
+    const chimney = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.08, 0.12, 0.3, 8),
+        matLocoChimney
+    );
+    chimney.position.set(0.55, 0.7, 0);
+    chimney.castShadow = true;
+    group.add(chimney);
+
+    // Chimney top rim
+    const rim = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.1, 0.08, 0.05, 8),
+        matLocoChimney
+    );
+    rim.position.set(0.55, 0.87, 0);
+    group.add(rim);
+
+    // Base frame
+    const frame = new THREE.Mesh(
+        new THREE.BoxGeometry(1.6, 0.1, 0.6),
+        matLocoBody
+    );
+    frame.position.set(0, 0.1, 0);
+    frame.castShadow = true;
+    group.add(frame);
+
+    // Wheels
+    const wheelGeo = new THREE.CylinderGeometry(0.12, 0.12, 0.05, 16);
+    const wheels = [];
+    for (let side of [-1, 1]) {
+        for (let pos of [0.5, 0.15, -0.2, -0.55]) {
+            const w = new THREE.Mesh(wheelGeo, matWheel);
+            w.rotation.x = Math.PI / 2;
+            w.position.set(pos, 0.12, side * 0.34);
+            w.castShadow = true;
+            group.add(w);
+            wheels.push(w);
+        }
+    }
+    // Connector rods between wheels
+    const rodGeo = new THREE.CylinderGeometry(0.015, 0.015, 1.0, 6);
+    const rod = new THREE.Mesh(rodGeo, matSteel);
+    rod.rotation.z = Math.PI / 2;
+    rod.position.set(-0.025, 0.12, 0.37);
+    group.add(rod);
+    const rod2 = rod.clone();
+    rod2.position.z = -0.37;
+    group.add(rod2);
+
+    // Headlight
+    const lightGeo = new THREE.SphereGeometry(0.05, 8, 8);
+    const lightMat = new THREE.MeshStandardMaterial({ color: 0xffffaa, emissive: 0xffff88, emissiveIntensity: 2 });
+    const headlight = new THREE.Mesh(lightGeo, lightMat);
+    headlight.position.set(0.9, 0.42, 0);
+    group.add(headlight);
+
+    group.userData = { wheels, chimneyTop: new THREE.Vector3(0.55, 0.9, 0) };
+    return group;
+}
+
+function buildCarriage(color, length = 1.0) {
+    const group = new THREE.Group();
+    const mat = typeof color === 'number'
+        ? new THREE.MeshStandardMaterial({ color, roughness: 0.35, metalness: 0.15 })
+        : color;
+
+    // Body
+    const body = new THREE.Mesh(
+        new THREE.BoxGeometry(length, 0.4, 0.52),
+        mat
+    );
+    body.position.y = 0.35;
+    body.castShadow = true;
+    group.add(body);
+
+    // Roof (slightly curved effect via box)
+    const roofMat = new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.3, metalness: 0.3 });
+    const roof = new THREE.Mesh(
+        new THREE.BoxGeometry(length + 0.04, 0.06, 0.56),
+        roofMat
+    );
+    roof.position.y = 0.58;
+    roof.castShadow = true;
+    group.add(roof);
+
+    // Windows (emissive strips)
+    const winMat = new THREE.MeshStandardMaterial({
+        color: 0x88ccff, emissive: 0x224466, emissiveIntensity: 0.5,
+        roughness: 0.1, metalness: 0.8
+    });
+    for (let side of [-1, 1]) {
+        const win = new THREE.Mesh(new THREE.BoxGeometry(length * 0.75, 0.12, 0.01), winMat);
+        win.position.set(0, 0.38, side * 0.265);
+        group.add(win);
+    }
+
+    // Base
+    const base = new THREE.Mesh(
+        new THREE.BoxGeometry(length + 0.05, 0.08, 0.58),
+        new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5, metalness: 0.4 })
+    );
+    base.position.y = 0.08;
+    base.castShadow = true;
+    group.add(base);
+
+    // Wheels
+    const wheelGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.04, 12);
+    const wheels = [];
+    for (let side of [-1, 1]) {
+        for (let z of [length * 0.35, -length * 0.35]) {
+            const w = new THREE.Mesh(wheelGeo, matWheel);
+            w.rotation.x = Math.PI / 2;
+            w.position.set(z, 0.1, side * 0.32);
+            w.castShadow = true;
+            group.add(w);
+            wheels.push(w);
+        }
+    }
+
+    group.userData = { wheels };
+    return group;
+}
+
+// Build the full train
+const loco = buildLocomotive();
+scene.add(loco);
+
+const carriages = [];
+const carriageColors = [0xcc2222, 0x2255bb, 0xddaa00, 0x228844];
+carriageColors.forEach((c, i) => {
+    const car = buildCarriage(c, 0.9);
+    scene.add(car);
+    carriages.push(car);
+});
+
+// Dynamic couplings (bars between consecutive vehicles)
+const allCars = [loco, ...carriages];
+const couplingBars = [];
+for (let i = 0; i < allCars.length - 1; i++) {
+    const bar = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.012, 0.012, 1, 6),
+        matSteel
+    );
+    bar.castShadow = true;
+    scene.add(bar);
+    couplingBars.push(bar);
+}
+
+// Coupling hook rings
+const couplingHooks = [];
+for (let i = 0; i < allCars.length - 1; i++) {
+    const hookGeo = new THREE.TorusGeometry(0.04, 0.01, 6, 8, Math.PI);
+    const h1 = new THREE.Mesh(hookGeo, matSteel);
+    const h2 = new THREE.Mesh(hookGeo, matSteel);
+    scene.add(h1);
+    scene.add(h2);
+    couplingHooks.push({ front: h1, rear: h2 });
+}
+
+// ============================================================
+// Smoke Particles
+// ============================================================
+const SMOKE_COUNT = 40;
+const smokeTexture = (() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const ctx = c.getContext('2d');
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, 'rgba(220,220,220,0.8)');
+    grad.addColorStop(0.4, 'rgba(200,200,200,0.4)');
+    grad.addColorStop(1, 'rgba(180,180,180,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    return new THREE.CanvasTexture(c);
+})();
+
+const smokeParticles = [];
+for (let i = 0; i < SMOKE_COUNT; i++) {
+    const spriteMat = new THREE.SpriteMaterial({
+        map: smokeTexture,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+    });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.visible = false;
+    scene.add(sprite);
+    smokeParticles.push({
+        sprite, age: 999, maxAge: 2.5 + Math.random() * 1.5,
+        vx: 0, vy: 0, vz: 0,
+    });
+}
+let smokeIdx = 0;
+let smokeTimer = 0;
+
+function emitSmoke(worldPos, trainTangent) {
+    const p = smokeParticles[smokeIdx];
+    p.sprite.visible = true;
+    p.sprite.position.copy(worldPos);
+    p.sprite.scale.set(0.15, 0.15, 0.15);
+    p.sprite.material.opacity = 0.5;
+    p.age = 0;
+    p.maxAge = 2 + Math.random() * 1.5;
+    p.vx = trainTangent.x * 0.3 + (Math.random() - 0.5) * 0.2;
+    p.vy = 0.8 + Math.random() * 0.4;
+    p.vz = trainTangent.z * 0.3 + (Math.random() - 0.5) * 0.2;
+    smokeIdx = (smokeIdx + 1) % SMOKE_COUNT;
+}
+
+// ============================================================
+// Clouds
+// ============================================================
+function createCloud(x, y, z) {
+    const group = new THREE.Group();
+    const cloudMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff, roughness: 1, metalness: 0,
+        transparent: true, opacity: 0.85
+    });
+    const count = 3 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < count; i++) {
+        const r = 0.8 + Math.random() * 1.2;
+        const sphere = new THREE.Mesh(new THREE.SphereGeometry(r, 8, 6), cloudMat);
+        sphere.position.set(
+            (Math.random() - 0.5) * 3,
+            (Math.random() - 0.5) * 0.6,
+            (Math.random() - 0.5) * 1.5
+        );
+        sphere.scale.y = 0.5;
+        group.add(sphere);
+    }
+    group.position.set(x, y, z);
+    return group;
+}
+
+const clouds = [];
+const cloudData = [
+    [-15, 18, -10], [10, 20, 15], [25, 17, -5], [-8, 22, 20],
+    [20, 19, 18], [-25, 16, 8], [0, 21, -20], [15, 23, -15],
+    [-20, 20, -18], [30, 18, 10],
+];
+cloudData.forEach(([x, y, z]) => {
+    const c = createCloud(x, y, z);
+    scene.add(c);
+    clouds.push(c);
+});
+
+// ============================================================
+// Small flowers / bushes on ground
+// ============================================================
+const bushGeo = new THREE.SphereGeometry(0.2, 6, 4);
+const bushMat = new THREE.MeshStandardMaterial({ color: 0x3a8a3a, roughness: 0.85 });
+for (let i = 0; i < 30; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 3 + Math.random() * 22;
+    const x = Math.cos(angle) * dist;
+    const z = Math.sin(angle) * dist;
+    if (!isNearTrack(x, z, 1.5)) {
+        const bush = new THREE.Mesh(bushGeo, bushMat);
+        bush.position.set(x, 0.12, z);
+        bush.scale.setScalar(0.5 + Math.random() * 1);
+        bush.castShadow = true;
+        scene.add(bush);
+    }
+}
+
+// ============================================================
+// Animation
+// ============================================================
+let progress = 0;
+const TRAIN_SPEED = 0.012;
+const CAR_GAP = 0.032;
+const WHEEL_RADIUS = 0.12;
+const fpsEl = document.getElementById('fps');
+let frames = 0, lastFpsTime = performance.now();
+const clock = new THREE.Clock();
+
+function placeTrainOnTrack(group, t, yOffset = 0.08) {
+    const pos = trackCurve.getPointAt(t);
+    const tang = trackCurve.getTangentAt(t);
+    group.position.copy(pos);
+    group.position.y += yOffset;
+    // lookAt makes -Z face the target, but our models face +X
+    // so we apply an extra 90° rotation around Y
+    const m = new THREE.Matrix4();
+    m.lookAt(pos, pos.clone().add(tang), new THREE.Vector3(0, 1, 0));
+    const q = new THREE.Quaternion().setFromRotationMatrix(m);
+    q.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2));
+    group.quaternion.copy(q);
+    return tang;
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    const dt = clock.getDelta();
+
+    // Move train
+    progress += TRAIN_SPEED * dt;
+    if (progress > 1) progress -= 1;
+
+    // Locomotive
+    const locoTang = placeTrainOnTrack(loco, progress);
+    // Rotate wheels
+    const wheelRot = (TRAIN_SPEED * dt * trackCurve.getLength()) / WHEEL_RADIUS;
+    loco.userData.wheels.forEach(w => { w.rotation.y += wheelRot; });
+
+    // Smoke from chimney
+    smokeTimer += dt;
+    if (smokeTimer > 0.06) {
+        smokeTimer = 0;
+        const chimneyWorld = loco.userData.chimneyTop.clone();
+        loco.localToWorld(chimneyWorld);
+        emitSmoke(chimneyWorld, locoTang);
+    }
+
+    // Carriages
+    carriages.forEach((car, i) => {
+        const carT = (progress - (i + 1) * CAR_GAP % 1 + 1) % 1;
+        placeTrainOnTrack(car, carT);
+        car.userData.wheels.forEach(w => { w.rotation.y += wheelRot; });
+    });
+
+    // Update couplings between consecutive vehicles
+    for (let i = 0; i < couplingBars.length; i++) {
+        const frontCar = allCars[i];
+        const rearCar = allCars[i + 1];
+        const rearPos = new THREE.Vector3(-0.85, 0.2, 0); // rear of loco
+        const frontPos = new THREE.Vector3(0.5, 0.2, 0);  // front of carriage
+        if (i > 0) {
+            rearPos.set(-0.5, 0.2, 0);
+        }
+
+        const worldRear = rearPos.clone().applyMatrix4(frontCar.matrixWorld);
+        const worldFront = frontPos.clone().applyMatrix4(rearCar.matrixWorld);
+
+        const mid = worldRear.clone().add(worldFront).multiplyScalar(0.5);
+        const dir = worldFront.clone().sub(worldRear);
+        const dist = dir.length();
+
+        const bar = couplingBars[i];
+        bar.position.copy(mid);
+        bar.scale.set(1, dist, 1);
+        bar.quaternion.setFromUnitVectors(
+            new THREE.Vector3(0, 1, 0),
+            dir.normalize()
+        );
+
+        // Hooks at each end
+        const hooks = couplingHooks[i];
+        hooks.front.position.copy(worldRear);
+        hooks.rear.position.copy(worldFront);
+        // Orient hooks to face the coupling direction
+        hooks.front.quaternion.copy(bar.quaternion);
+        hooks.rear.quaternion.copy(bar.quaternion);
+    }
+
+    // Smoke update
+    smokeParticles.forEach(p => {
+        if (!p.sprite.visible) return;
+        p.age += dt;
+        if (p.age > p.maxAge) {
+            p.sprite.visible = false;
+            return;
+        }
+        const life = p.age / p.maxAge;
+        p.sprite.position.x += p.vx * dt;
+        p.sprite.position.y += p.vy * dt;
+        p.sprite.position.z += p.vz * dt;
+        p.vy *= 0.995;
+        const s = 0.15 + life * 1.5;
+        p.sprite.scale.set(s, s, s);
+        p.sprite.material.opacity = 0.5 * (1 - life * life);
+    });
+
+    // Clouds drift
+    clouds.forEach((c, i) => {
+        c.position.x += 0.3 * dt;
+        if (c.position.x > 45) c.position.x = -45;
+    });
+
+    // FPS
+    frames++;
+    const now = performance.now();
+    if (now - lastFpsTime >= 1000) {
+        fpsEl.textContent = `FPS: ${frames}`;
+        frames = 0;
+        lastFpsTime = now;
+    }
+
+    controls.update();
+    if (isWebGPU) {
+        renderer.renderAsync(scene, camera).catch(e => console.error('render error:', e));
+    } else {
+        renderer.render(scene, camera);
+    }
+}
+
+// ============================================================
+// Init & Start
+// ============================================================
+async function init() {
+    try {
+        renderer = await createRenderer();
+    } catch (e) {
+        document.body.innerHTML = `<div style="color:red;padding:40px;font-size:18px;">Renderer 初始化失败: ${e.message}</div>`;
+        return;
+    }
+
+    badge.textContent = isWebGPU ? 'WebGPU' : 'WebGL Fallback';
+    badge.className = isWebGPU ? 'gpu-webgpu' : 'gpu-webgl';
+
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    // Now create controls (needs renderer.domElement)
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.maxPolarAngle = Math.PI / 2.05;
+    controls.minDistance = 5;
+    controls.maxDistance = 60;
+    controls.target.set(0, 0, 0);
+
+    animate();
+}
+
+init();
+    </script>
+</body>
+</html>
