@@ -26,6 +26,24 @@
         }
         .gpu-webgpu { background: rgba(0,200,120,0.3); color: #64ffda; }
         .gpu-webgl  { background: rgba(200,150,0,0.3); color: #ffc107; }
+        #depart-btn {
+            display: none;
+            position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+            padding: 14px 48px; border: none; border-radius: 12px;
+            font-size: 18px; font-weight: 600; cursor: pointer;
+            color: #fff; background: linear-gradient(135deg, #1a936f, #88d498);
+            box-shadow: 0 4px 20px rgba(26,147,111,0.5);
+            transition: transform 0.15s, box-shadow 0.15s;
+            pointer-events: auto; z-index: 100;
+        }
+        #depart-btn:hover { transform: translateX(-50%) scale(1.05); box-shadow: 0 6px 28px rgba(26,147,111,0.7); }
+        #depart-btn:active { transform: translateX(-50%) scale(0.97); }
+        #station-label {
+            position: fixed; bottom: 100px; left: 50%; transform: translateX(-50%);
+            color: #64ffda; background: rgba(0,0,0,0.5); padding: 8px 20px;
+            border-radius: 8px; font-size: 14px; display: none;
+            pointer-events: none; backdrop-filter: blur(4px);
+        }
     </style>
     <script type="importmap">
     {
@@ -43,6 +61,8 @@
         <div id="fps" class="sub">FPS: --</div>
     </div>
     <div id="gpu-badge" class="gpu-webgpu">WebGPU</div>
+    <button id="depart-btn">发车</button>
+    <div id="station-label">列车到站，请耐心等候</div>
 
     <script type="module">
 import * as THREE from 'three';
@@ -415,57 +435,78 @@ function buildLocomotive() {
 
 function buildCarriage(color, length = 1.0) {
     const group = new THREE.Group();
-    const mat = typeof color === 'number'
-        ? new THREE.MeshStandardMaterial({ color, roughness: 0.35, metalness: 0.15 })
-        : color;
+    const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.3, metalness: 0.15 });
 
-    // Body
+    // Body (passenger car - taller)
     const body = new THREE.Mesh(
-        new THREE.BoxGeometry(length, 0.4, 0.52),
+        new THREE.BoxGeometry(length, 0.5, 0.54),
         mat
     );
-    body.position.y = 0.35;
+    body.position.y = 0.38;
     body.castShadow = true;
     group.add(body);
 
-    // Roof (slightly curved effect via box)
-    const roofMat = new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.3, metalness: 0.3 });
+    // White stripe along the middle
+    const stripeMat = new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.4 });
+    for (let side of [-1, 1]) {
+        const stripe = new THREE.Mesh(new THREE.BoxGeometry(length + 0.01, 0.06, 0.01), stripeMat);
+        stripe.position.set(0, 0.35, side * 0.275);
+        group.add(stripe);
+    }
+
+    // Roof
+    const roofMat = new THREE.MeshStandardMaterial({ color: 0xdddddd, roughness: 0.3, metalness: 0.2 });
     const roof = new THREE.Mesh(
-        new THREE.BoxGeometry(length + 0.04, 0.06, 0.56),
+        new THREE.BoxGeometry(length + 0.04, 0.06, 0.58),
         roofMat
     );
-    roof.position.y = 0.58;
+    roof.position.y = 0.66;
     roof.castShadow = true;
     group.add(roof);
 
-    // Windows (emissive strips)
+    // Windows - double row, multiple per side
     const winMat = new THREE.MeshStandardMaterial({
-        color: 0x88ccff, emissive: 0x224466, emissiveIntensity: 0.5,
-        roughness: 0.1, metalness: 0.8
+        color: 0xaaddff, emissive: 0x336688, emissiveIntensity: 0.6,
+        roughness: 0.05, metalness: 0.9
     });
+    const winW = 0.1, winH = 0.12;
+    const windowsPerSide = Math.floor(length / 0.18);
     for (let side of [-1, 1]) {
-        const win = new THREE.Mesh(new THREE.BoxGeometry(length * 0.75, 0.12, 0.01), winMat);
-        win.position.set(0, 0.38, side * 0.265);
-        group.add(win);
+        for (let row of [0.42, 0.55]) { // two rows
+            for (let wi = 0; wi < windowsPerSide; wi++) {
+                const wx = -length * 0.4 + wi * (length * 0.8 / windowsPerSide) + (length * 0.4 / windowsPerSide);
+                const win = new THREE.Mesh(new THREE.BoxGeometry(winW, winH, 0.01), winMat);
+                win.position.set(wx, row, side * 0.275);
+                group.add(win);
+            }
+        }
+    }
+
+    // Doors (one per side)
+    const doorMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5 });
+    for (let side of [-1, 1]) {
+        const door = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.35, 0.01), doorMat);
+        door.position.set(length * 0.38, 0.35, side * 0.275);
+        group.add(door);
     }
 
     // Base
     const base = new THREE.Mesh(
-        new THREE.BoxGeometry(length + 0.05, 0.08, 0.58),
+        new THREE.BoxGeometry(length + 0.05, 0.08, 0.6),
         new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5, metalness: 0.4 })
     );
     base.position.y = 0.08;
     base.castShadow = true;
     group.add(base);
 
-    // Wheels
+    // Wheels (3 axles for passenger car)
     const wheelGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.04, 12);
     const wheels = [];
     for (let side of [-1, 1]) {
-        for (let z of [length * 0.35, -length * 0.35]) {
+        for (let z of [length * 0.38, 0, -length * 0.38]) {
             const w = new THREE.Mesh(wheelGeo, matWheel);
             w.rotation.x = Math.PI / 2;
-            w.position.set(z, 0.1, side * 0.32);
+            w.position.set(z, 0.1, side * 0.34);
             w.castShadow = true;
             group.add(w);
             wheels.push(w);
@@ -619,23 +660,169 @@ for (let i = 0; i < 30; i++) {
 }
 
 // ============================================================
-// Animation
+// Station Platform
+// ============================================================
+// t=0.31 is on the straightest section: (-3,0,11) → (5,0,10)
+const STATION_T = 0.31;
+const stationPos = trackCurve.getPointAt(STATION_T);
+const stationTangent = trackCurve.getTangentAt(STATION_T).normalize();
+// Perpendicular pointing outward from track center
+const stNx = -stationTangent.z, stNz = stationTangent.x;
+// Align local +X with tangent: θ = atan2(-tz, tx)
+const stationAngle = Math.atan2(-stationTangent.z, stationTangent.x);
+
+const matPlatform = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.85 });
+const matYellow = new THREE.MeshStandardMaterial({ color: 0xeecc00, roughness: 0.5 });
+const matRoof = new THREE.MeshStandardMaterial({ color: 0x445566, roughness: 0.4, metalness: 0.3 });
+const matPillar = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, roughness: 0.3, metalness: 0.6 });
+
+const stationGroup = new THREE.Group();
+// Platform surface (long axis along X = track direction)
+const platform = new THREE.Mesh(new THREE.BoxGeometry(11, 0.2, 1.8), matPlatform);
+platform.position.set(0, 0.1, 0);
+platform.receiveShadow = true; platform.castShadow = true;
+stationGroup.add(platform);
+// Yellow safety line (on the track-facing edge, local -Z side)
+const safetyLine = new THREE.Mesh(new THREE.BoxGeometry(10.8, 0.21, 0.06), matYellow);
+safetyLine.position.set(0, 0.105, -0.82);
+stationGroup.add(safetyLine);
+// Back fence
+const fence = new THREE.Mesh(new THREE.BoxGeometry(11, 0.6, 0.05), matPlatform);
+fence.position.set(0, 0.5, 0.92);
+stationGroup.add(fence);
+// Roof
+const roofMesh = new THREE.Mesh(new THREE.BoxGeometry(11.4, 0.05, 2.2), matRoof);
+roofMesh.position.set(0, 2.4, 0.1);
+roofMesh.castShadow = true;
+stationGroup.add(roofMesh);
+// Pillars
+for (let px of [-4.5, -1.5, 1.5, 4.5]) {
+    for (let pz of [-0.7, 0.9]) {
+        const pillar = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 2.4, 6), matPillar);
+        pillar.position.set(px, 1.3, pz);
+        pillar.castShadow = true;
+        stationGroup.add(pillar);
+    }
+}
+// Bench
+const benchMat = new THREE.MeshStandardMaterial({ color: 0x6b4226, roughness: 0.85 });
+const benchSeat = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.04, 0.3), benchMat);
+benchSeat.position.set(1.5, 0.32, 0.4);
+stationGroup.add(benchSeat);
+for (let bx of [1.15, 1.85]) {
+    const benchLeg = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.22, 0.3), benchMat);
+    benchLeg.position.set(bx, 0.21, 0.4);
+    stationGroup.add(benchLeg);
+}
+// Station sign
+const signMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+const signPost = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 1.2, 6), matPillar);
+signPost.position.set(-2, 1.3, 0);
+stationGroup.add(signPost);
+const signBoard = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.25, 0.02), signMat);
+signBoard.position.set(-2, 2.0, 0);
+stationGroup.add(signBoard);
+
+// Position: offset 2 units perpendicular from track center
+stationGroup.position.set(
+    stationPos.x + stNx * 2,
+    0,
+    stationPos.z + stNz * 2
+);
+stationGroup.rotation.y = stationAngle;
+scene.add(stationGroup);
+
+// Precompute world positions for passenger animation
+// Track edge (near the train doors)
+const trainEdgeWorld = new THREE.Vector3(
+    stationPos.x + stNx * 0.8,
+    0,
+    stationPos.z + stNz * 0.8
+);
+// Platform interior
+const platformWorld = new THREE.Vector3(
+    stationPos.x + stNx * 2.2,
+    0,
+    stationPos.z + stNz * 2.2
+);
+
+// ============================================================
+// Passengers
+// ============================================================
+const CLOTHES_COLORS = [0xcc3333, 0x3366cc, 0x33aa33, 0xddaa00, 0xaa33aa, 0x336666, 0xff6600, 0xcc6699];
+const passengers = [];
+const PASSENGER_COUNT = 10;
+
+function createPassenger() {
+    const group = new THREE.Group();
+    const clothColor = CLOTHES_COLORS[Math.floor(Math.random() * CLOTHES_COLORS.length)];
+    const clothMat = new THREE.MeshStandardMaterial({ color: clothColor, roughness: 0.7 });
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.07, 0.3, 6), clothMat);
+    body.position.y = 0.3;
+    group.add(body);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0xffccaa, roughness: 0.8 });
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 4), headMat);
+    head.position.y = 0.52;
+    group.add(head);
+    const legMat = new THREE.MeshStandardMaterial({ color: 0x333355, roughness: 0.8 });
+    for (let lx of [-0.025, 0.025]) {
+        const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.15, 4), legMat);
+        leg.position.set(lx, 0.075, 0);
+        group.add(leg);
+    }
+    group.visible = false;
+    group.castShadow = true;
+    scene.add(group);
+    return group;
+}
+
+for (let i = 0; i < PASSENGER_COUNT; i++) {
+    passengers.push(createPassenger());
+}
+
+// ============================================================
+// Train State & Stop Logic
 // ============================================================
 let progress = 0;
-const TRAIN_SPEED = 0.012;
-const CAR_GAP = 0.032;
+const TRAIN_SPEED = 0.014;
+const CAR_GAP = 0.02;
 const WHEEL_RADIUS = 0.12;
+const STOP_T = STATION_T + 2 * CAR_GAP; // loco stops here so train center ≈ platform center
+const DECEL_DISTANCE = 0.03;
+let currentSpeed = TRAIN_SPEED;
+let trainState = 'running'; // 'running' | 'stopping' | 'stopped'
+let stopTimer = 0;
+const STOP_DURATION = 6; // seconds stopped
+let passengerAnimProgress = 0;
 const fpsEl = document.getElementById('fps');
+const departBtn = document.getElementById('depart-btn');
+const stationLabel = document.getElementById('station-label');
 let frames = 0, lastFpsTime = performance.now();
 const clock = new THREE.Clock();
+
+departBtn.addEventListener('click', () => {
+    if (trainState === 'stopped') {
+        trainState = 'running';
+        currentSpeed = TRAIN_SPEED;
+        // Push past the decel zone so it won't re-trigger stopping
+        progress = (STOP_T + DECEL_DISTANCE + 0.01) % 1;
+        departBtn.style.display = 'none';
+        stationLabel.style.display = 'none';
+        passengers.forEach(p => { p.visible = false; });
+    }
+});
+
+function distOnTrack(a, b) {
+    let d = Math.abs(a - b);
+    if (d > 0.5) d = 1 - d;
+    return d;
+}
 
 function placeTrainOnTrack(group, t, yOffset = 0.08) {
     const pos = trackCurve.getPointAt(t);
     const tang = trackCurve.getTangentAt(t);
     group.position.copy(pos);
     group.position.y += yOffset;
-    // lookAt makes -Z face the target, but our models face +X
-    // so we apply an extra 90° rotation around Y
     const m = new THREE.Matrix4();
     m.lookAt(pos, pos.clone().add(tang), new THREE.Vector3(0, 1, 0));
     const q = new THREE.Quaternion().setFromRotationMatrix(m);
@@ -644,27 +831,120 @@ function placeTrainOnTrack(group, t, yOffset = 0.08) {
     return tang;
 }
 
+function updatePassengers(dt) {
+    if (trainState !== 'stopped') return;
+    stopTimer += dt;
+
+    // Phase 1: 0-3s passengers get off train (walk from train to platform)
+    // Phase 2: 3-4.5s idle on platform
+    // Phase 3: 4.5-7s passengers get on train (walk from platform to train, disappear)
+    const offCount = Math.floor(PASSENGER_COUNT * 0.6); // 6 get off
+    const onCount = PASSENGER_COUNT - offCount;           // 4 get on
+
+    for (let i = 0; i < passengers.length; i++) {
+        const p = passengers[i];
+        // Spread passengers along the track direction
+        const spread = (i - PASSENGER_COUNT / 2 + 0.5) * 0.45;
+        const alongX = stationTangent.x * spread;
+        const alongZ = stationTangent.z * spread;
+        // Stagger timing per passenger
+        const stagger = i * 0.15;
+
+        if (i < offCount) {
+            // This passenger gets OFF the train
+            const phase = stopTimer - stagger;
+            if (phase < 0) {
+                p.visible = false; continue;
+            }
+            p.visible = true;
+            const walkDuration = 2.0;
+            if (phase < walkDuration) {
+                // Walking from train side to platform
+                const t = phase / walkDuration;
+                const pos = trainEdgeWorld.clone().lerp(platformWorld, t);
+                p.position.set(pos.x + alongX, 0, pos.z + alongZ);
+                // Face toward platform (perpendicular to track, outward)
+                p.rotation.y = stationAngle + Math.PI / 2;
+            } else {
+                // Standing on platform
+                p.position.set(platformWorld.x + alongX, 0, platformWorld.z + alongZ);
+                p.rotation.y = stationAngle + Math.PI / 2;
+            }
+        } else {
+            // This passenger gets ON the train
+            const phase = stopTimer - 4.5 - stagger;
+            if (phase < 0) {
+                // Waiting on platform
+                p.visible = true;
+                p.position.set(platformWorld.x + alongX, 0, platformWorld.z + alongZ);
+                p.rotation.y = stationAngle + Math.PI / 2;
+                continue;
+            }
+            const walkDuration = 2.0;
+            if (phase < walkDuration) {
+                // Walking from platform toward train
+                const t = phase / walkDuration;
+                const pos = platformWorld.clone().lerp(trainEdgeWorld, t);
+                p.position.set(pos.x + alongX, 0, pos.z + alongZ);
+                p.rotation.y = stationAngle - Math.PI / 2; // face toward train
+            } else {
+                // Disappeared into the train
+                p.visible = false;
+            }
+        }
+    }
+}
+
 function animate() {
     requestAnimationFrame(animate);
     const dt = clock.getDelta();
 
+    // Stop/start logic
+    if (trainState === 'running') {
+        const distToStop = distOnTrack(progress, STOP_T);
+        if (distToStop < DECEL_DISTANCE) {
+            trainState = 'stopping';
+        }
+    }
+
+    if (trainState === 'stopping') {
+        const distToStop = distOnTrack(progress, STOP_T);
+        if (distToStop < 0.002) {
+            currentSpeed = 0;
+            trainState = 'stopped';
+            stopTimer = 0;
+            passengerAnimProgress = 0;
+            departBtn.style.display = 'block';
+            stationLabel.style.display = 'block';
+        } else {
+            currentSpeed = TRAIN_SPEED * Math.max(0, (distToStop - 0.001) / DECEL_DISTANCE);
+            currentSpeed = Math.max(currentSpeed, 0.001);
+        }
+    }
+
+    if (trainState === 'stopped') {
+        currentSpeed = 0;
+    }
+
     // Move train
-    progress += TRAIN_SPEED * dt;
+    progress += currentSpeed * dt;
     if (progress > 1) progress -= 1;
+    if (progress < 0) progress += 1;
 
     // Locomotive
     const locoTang = placeTrainOnTrack(loco, progress);
-    // Rotate wheels
-    const wheelRot = (TRAIN_SPEED * dt * trackCurve.getLength()) / WHEEL_RADIUS;
+    const wheelRot = (currentSpeed * dt * trackCurve.getLength()) / WHEEL_RADIUS;
     loco.userData.wheels.forEach(w => { w.rotation.y += wheelRot; });
 
-    // Smoke from chimney
-    smokeTimer += dt;
-    if (smokeTimer > 0.06) {
-        smokeTimer = 0;
-        const chimneyWorld = loco.userData.chimneyTop.clone();
-        loco.localToWorld(chimneyWorld);
-        emitSmoke(chimneyWorld, locoTang);
+    // Smoke from chimney (only when moving)
+    if (currentSpeed > 0) {
+        smokeTimer += dt;
+        if (smokeTimer > 0.06) {
+            smokeTimer = 0;
+            const chimneyWorld = loco.userData.chimneyTop.clone();
+            loco.localToWorld(chimneyWorld);
+            emitSmoke(chimneyWorld, locoTang);
+        }
     }
 
     // Carriages
@@ -674,15 +954,13 @@ function animate() {
         car.userData.wheels.forEach(w => { w.rotation.y += wheelRot; });
     });
 
-    // Update couplings between consecutive vehicles
+    // Update couplings
     for (let i = 0; i < couplingBars.length; i++) {
         const frontCar = allCars[i];
         const rearCar = allCars[i + 1];
-        const rearPos = new THREE.Vector3(-0.85, 0.2, 0); // rear of loco
-        const frontPos = new THREE.Vector3(0.5, 0.2, 0);  // front of carriage
-        if (i > 0) {
-            rearPos.set(-0.5, 0.2, 0);
-        }
+        const rearPos = new THREE.Vector3(-0.85, 0.2, 0);
+        const frontPos = new THREE.Vector3(0.5, 0.2, 0);
+        if (i > 0) rearPos.set(-0.5, 0.2, 0);
 
         const worldRear = rearPos.clone().applyMatrix4(frontCar.matrixWorld);
         const worldFront = frontPos.clone().applyMatrix4(rearCar.matrixWorld);
@@ -694,28 +972,23 @@ function animate() {
         const bar = couplingBars[i];
         bar.position.copy(mid);
         bar.scale.set(1, dist, 1);
-        bar.quaternion.setFromUnitVectors(
-            new THREE.Vector3(0, 1, 0),
-            dir.normalize()
-        );
+        bar.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
 
-        // Hooks at each end
         const hooks = couplingHooks[i];
         hooks.front.position.copy(worldRear);
         hooks.rear.position.copy(worldFront);
-        // Orient hooks to face the coupling direction
         hooks.front.quaternion.copy(bar.quaternion);
         hooks.rear.quaternion.copy(bar.quaternion);
     }
+
+    // Passenger animation
+    updatePassengers(dt);
 
     // Smoke update
     smokeParticles.forEach(p => {
         if (!p.sprite.visible) return;
         p.age += dt;
-        if (p.age > p.maxAge) {
-            p.sprite.visible = false;
-            return;
-        }
+        if (p.age > p.maxAge) { p.sprite.visible = false; return; }
         const life = p.age / p.maxAge;
         p.sprite.position.x += p.vx * dt;
         p.sprite.position.y += p.vy * dt;
@@ -727,7 +1000,7 @@ function animate() {
     });
 
     // Clouds drift
-    clouds.forEach((c, i) => {
+    clouds.forEach(c => {
         c.position.x += 0.3 * dt;
         if (c.position.x > 45) c.position.x = -45;
     });
